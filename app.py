@@ -357,7 +357,6 @@ with tab_batch:
                                 ids=[doc_id]
                             )
                             total_ingested += 1
-                        print(total_ingested)
                             
                     progress_bar.progress((i + 1) / len(uploaded_sql_files))
                     status_text.text(f"Processed {filename}...")
