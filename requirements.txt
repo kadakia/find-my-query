@@ -1,6 +1,0 @@
-streamlit
-chromadb
-openai
-pandas
-langfuse
-sqlparse
