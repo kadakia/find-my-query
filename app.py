@@ -4,24 +4,23 @@ import streamlit as st
 # -------------------------------------------------------------------
 # 1. SETUP & CONFIGURATION
 # -------------------------------------------------------------------
-st.set_page_config(page_title="SQL Search Engine", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="Find My Query", page_icon="🧠", layout="wide")
 
-required_secrets = ["OPENAI_API_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_HOST", "APP_USERS", "DEVELOPER_PASSWORD"]
+required_secrets = ["OPENAI_API_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_HOST", "PINECONE_API_KEY", "APP_USERS", "DEVELOPER_PASSWORD"]
 for secret in required_secrets:
     if secret not in st.secrets:
         st.error(f"Missing required secret: '{secret}'. Please add it to `.streamlit/secrets.toml`.")
         st.stop()
 
-# CRITICAL FIX: Set OS environment variables BEFORE importing Langfuse/OpenAI
-# so that the underlying OpenTelemetry providers initialize with the correct keys.
+# Set OS environment variables BEFORE importing Langfuse/OpenAI/Pinecone
 os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 os.environ["LANGFUSE_SECRET_KEY"] = st.secrets["LANGFUSE_SECRET_KEY"]
 os.environ["LANGFUSE_PUBLIC_KEY"] = st.secrets["LANGFUSE_PUBLIC_KEY"]
 os.environ["LANGFUSE_HOST"] = st.secrets["LANGFUSE_HOST"]
+os.environ["PINECONE_API_KEY"] = st.secrets["PINECONE_API_KEY"]
 
 import re
-import chromadb
-from chromadb.utils import embedding_functions
+from pinecone import Pinecone
 from openai import OpenAI
 import pandas as pd
 import json
@@ -30,22 +29,32 @@ import hashlib
 import sqlparse
 from langfuse import Langfuse
 
+# This variable now safely routes BOTH your Langfuse traces and your Pinecone database namespace!
 env_name = st.secrets.get("LANGFUSE_TRACING_ENVIRONMENT", "local-dev")
 
 # Initialize clients
 llm_client = OpenAI()
 langfuse = Langfuse()
 
-chroma_client = chromadb.PersistentClient(path="./sql_vector_db")
-openai_ef = embedding_functions.OpenAIEmbeddingFunction(
-    api_key=os.environ["OPENAI_API_KEY"],
-    model_name="text-embedding-3-small"
-)
+# Initialize Pinecone and connect to the index
+pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+index_name = "analyst-queries"
 
-collection = chroma_client.get_or_create_collection(
-    name="analyst_queries",
-    embedding_function=openai_ef
-)
+# Note: Pinecone indexes take a moment to provision on first creation. 
+# Ensure the index 'analyst-queries' exists in your Pinecone dashboard with 1536 dimensions.
+if index_name not in [idx.name for idx in pc.list_indexes()]:
+    st.error(f"Pinecone index '{index_name}' not found. Please create it in the Pinecone dashboard with 1536 dimensions.")
+    st.stop()
+
+index = pc.Index(index_name)
+
+def get_embedding(text):
+    """Calls OpenAI to convert text into a 1536-dimensional vector."""
+    response = llm_client.embeddings.create(
+        input=text,
+        model="text-embedding-3-small"
+    )
+    return response.data[0].embedding
 
 # -------------------------------------------------------------------
 # 2. APP USER AUTHORIZATION
@@ -145,14 +154,13 @@ def normalize_sql(raw_sql):
 
 def clean_extraneous_lines(raw_sql):
     """Removes standalone -- comments, /* */ comments, and blank lines."""
-    # Strip multiline comments entirely
     cleaned = re.sub(r'/\*.*?\*/', '', raw_sql, flags=re.DOTALL)
     
     final_lines = []
     for line in cleaned.splitlines():
         s = line.strip()
-        if not s: continue # Skip blank lines
-        if s.startswith('--'): continue # Skip standalone comment lines
+        if not s: continue 
+        if s.startswith('--'): continue 
         final_lines.append(line)
         
     return '\n'.join(final_lines)
@@ -162,30 +170,42 @@ def generate_doc_id(author, tenant, normalized_sql):
     unique_string = f"{author}_{tenant}_{normalized_sql}"
     return hashlib.md5(unique_string.encode()).hexdigest()
 
-def get_unique_metadata_values():
-    """Extracts unique tables, authors, and tenants from the Vector DB."""
-    all_docs = collection.get(include=["metadatas"])
+def get_all_pinecone_records():
+    """Fetches all records from Pinecone to populate dropdowns and the Vault."""
+    all_matches = []
+    # Pinecone list() yields lists of IDs in the namespace
+    for ids in index.list(namespace=env_name):
+        if ids:
+            fetch_res = index.fetch(ids=ids, namespace=env_name)
+            all_matches.extend(fetch_res.vectors.values())
+    return all_matches
+
+def get_unique_metadata_values(all_records):
+    """Extracts unique tables, authors, and tenants from fetched records."""
     tables, authors, tenants = set(), set(), set()
     
-    if all_docs and all_docs['metadatas']:
-        for meta in all_docs['metadatas']:
-            # Tables
-            t_str = meta.get('tables_involved', '')
-            if t_str:
-                tables.update([t for t in t_str.split(',') if t])
-            # Authors & Tenants
-            if meta.get('author'): authors.add(meta['author'])
-            if meta.get('tenant'): tenants.add(meta['tenant'])
+    for record in all_records:
+        meta = record.metadata
+        if not meta: continue
+        
+        if 'tables_involved' in meta and isinstance(meta['tables_involved'], list):
+            tables.update(meta['tables_involved'])
+        if 'author' in meta: authors.add(meta['author'])
+        if 'tenant' in meta: tenants.add(meta['tenant'])
             
     return sorted(list(tables)), sorted(list(authors)), sorted(list(tenants))
 
 # -------------------------------------------------------------------
 # 5. STREAMLIT USER INTERFACE
 # -------------------------------------------------------------------
-st.title(f"🧠 Find My Query (User: {current_app_user})")
-st.write(f"*Currently tracking **{collection.count()}** queries in the database.*")
+# Pre-fetch all records once per load for UI population
+all_db_records = get_all_pinecone_records()
+db_count = len(all_db_records)
 
-unique_tables, unique_authors, unique_tenants = get_unique_metadata_values()
+st.title(f"🧠 Find My Query (User: {current_app_user})")
+st.write(f"*Currently tracking **{db_count}** queries in the **{env_name}** environment.*")
+
+unique_tables, unique_authors, unique_tenants = get_unique_metadata_values(all_db_records)
 
 tab_search, tab_batch, tab_add, tab_vault = st.tabs([
     "🔍 Search Queries", "📂 Batch Import", "➕ Add New Query", "📚 Vault Overview"
@@ -193,12 +213,10 @@ tab_search, tab_batch, tab_add, tab_vault = st.tabs([
 
 # --- TAB 1: HYBRID SEARCH ---
 with tab_search:
-    
     col_text, col_voice = st.columns([3, 1])
     
     with col_voice:
         audio_val = st.audio_input("Speak your search:")
-        # If new audio is recorded, transcribe it with Whisper
         if audio_val and audio_val != st.session_state.get("last_audio"):
             with st.spinner("Transcribing..."):
                 transcript = llm_client.audio.transcriptions.create(
@@ -228,49 +246,54 @@ with tab_search:
         if search_term:
             start_time = time.time()
             
-            # Build ChromaDB Filters
+            # Build Pinecone Filters natively
             and_clauses = []
             if selected_type != "All":
-                and_clauses.append({"query_type": selected_type})
+                and_clauses.append({"query_type": {"$eq": selected_type}})
             
+            # For each table selected, ensure it is in the metadata array
             for table in selected_tables:
-                and_clauses.append({"tables_involved": {"$contains": f",{table},"}})
+                and_clauses.append({"tables_involved": table})
             
             if len(selected_authors) == 1:
-                and_clauses.append({"author": selected_authors[0]})
+                and_clauses.append({"author": {"$eq": selected_authors[0]}})
             elif len(selected_authors) > 1:
                 and_clauses.append({"author": {"$in": selected_authors}})
                 
             if len(selected_tenants) == 1:
-                and_clauses.append({"tenant": selected_tenants[0]})
+                and_clauses.append({"tenant": {"$eq": selected_tenants[0]}})
             elif len(selected_tenants) > 1:
                 and_clauses.append({"tenant": {"$in": selected_tenants}})
             
-            where_filter = None
+            filter_dict = None
             if len(and_clauses) == 1:
-                where_filter = and_clauses[0]
+                filter_dict = and_clauses[0]
             elif len(and_clauses) > 1:
-                where_filter = {"$and": and_clauses}
+                filter_dict = {"$and": and_clauses}
 
-            # Start Trace
             with langfuse.start_as_current_observation(as_type="span", name="Search Execution") as span:
                 langfuse.update_current_trace(tags=[env_name], user_id=current_app_user)
-                span.update(input={"search_term": search_term, "filters": where_filter})
+                span.update(input={"search_term": search_term, "filters": filter_dict})
 
-                results = collection.query(
-                    query_texts=[search_term],
-                    n_results=5, 
-                    where=where_filter
+                # Embed the search term and query Pinecone
+                query_vector = get_embedding(search_term)
+                
+                results = index.query(
+                    vector=query_vector,
+                    top_k=5, 
+                    include_metadata=True,
+                    filter=filter_dict,
+                    namespace=env_name
                 )
                 
                 exec_time = time.time() - start_time
                 st.success(f"Search completed in {exec_time:.2f} seconds.")
                 
                 logged_results = []
-                if results['ids'] and results['ids'][0]:
-                    for i in range(len(results['ids'][0])):
-                        r_summary = results['documents'][0][i]
-                        r_meta = results['metadatas'][0][i]
+                if results.matches:
+                    for match in results.matches:
+                        r_meta = match.metadata
+                        r_summary = r_meta.get('summary', 'No summary available.')
                         logged_results.append(r_summary)
                         
                         st.info(f"**Intent Summary:** {r_summary}")
@@ -280,7 +303,7 @@ with tab_search:
                         m_col2.caption(f"**Tenant:** {r_meta.get('tenant', 'Unknown')}")
                         m_col3.caption(f"**Type:** {r_meta.get('query_type', 'N/A')}")
                         
-                        st.code(r_meta['raw_sql'], language="sql")
+                        st.code(r_meta.get('raw_sql', ''), language="sql")
                         st.divider()
                     
                     span.update(output=logged_results, metadata={"execution_time_sec": exec_time, "results_count": len(logged_results)})
@@ -288,7 +311,6 @@ with tab_search:
                     st.warning("No matching queries found.")
                     span.update(output="No results", metadata={"execution_time_sec": exec_time})
             
-            # Ensure traces are sent before the execution ends
             langfuse.flush()
 
 # --- TAB 2: BATCH IMPORT ---
@@ -323,39 +345,38 @@ with tab_batch:
                         
                     author = parts[0].strip()
                     tenant = parts[1].strip()
-                    
                     raw_text = file.read().decode("utf-8")
-                    
-                    # Use sqlparse to safely extract individual queries, ignoring pure comments
                     parsed_statements = sqlparse.split(raw_text)
                     
                     for stmt in parsed_statements:
-                        # Clean extraneous lines before sending to LLM
                         cleaned_stmt = clean_extraneous_lines(stmt)
-                        
                         norm_sql = normalize_sql(cleaned_stmt)
-                        if not norm_sql: continue # Skip empty strings or comment-only blocks
+                        if not norm_sql: continue 
                         
                         total_queries_found += 1
                         doc_id = generate_doc_id(author, tenant, norm_sql)
                         
-                        # Deduplication check
-                        if not collection.get(ids=[doc_id])['ids']:
+                        # Deduplication check in Pinecone namespace
+                        fetch_res = index.fetch(ids=[doc_id], namespace=env_name)
+                        if doc_id not in fetch_res.vectors:
                             enrichment = generate_enrichment_data(cleaned_stmt)
                             tables_list = enrichment.get("tables_involved", [])
+                            summary_text = enrichment.get("summary", "")
                             
-                            collection.add(
-                                documents=[enrichment.get("summary", "")],
-                                metadatas=[{
-                                    "raw_sql": cleaned_stmt.strip(), 
-                                    "normalized_sql": norm_sql,
-                                    "query_type": enrichment.get("query_type", "UNKNOWN"),
-                                    "tables_involved": f",{','.join(tables_list)}," if tables_list else "",
-                                    "author": author,
-                                    "tenant": tenant
-                                }],
-                                ids=[doc_id]
-                            )
+                            # Embed the generated summary
+                            vector = get_embedding(summary_text)
+                            
+                            metadata = {
+                                "summary": summary_text,
+                                "raw_sql": cleaned_stmt.strip(), 
+                                "normalized_sql": norm_sql,
+                                "query_type": enrichment.get("query_type", "UNKNOWN"),
+                                "tables_involved": tables_list,
+                                "author": author,
+                                "tenant": tenant
+                            }
+                            
+                            index.upsert(vectors=[{"id": doc_id, "values": vector, "metadata": metadata}], namespace=env_name)
                             total_ingested += 1
                             
                     progress_bar.progress((i + 1) / len(uploaded_sql_files))
@@ -369,6 +390,8 @@ with tab_batch:
             st.success(f"Batch complete in {exec_time:.2f} seconds!")
             st.metric(label="Total Queries Found", value=total_queries_found)
             st.metric(label="Non-Redundant Queries Ingested", value=total_ingested)
+            time.sleep(2) # Give Pinecone a moment to index before user switches tabs
+            st.rerun() # Refresh to update the global count
             
         else:
             st.error("Please upload at least one `.sql` file.")
@@ -394,62 +417,67 @@ with tab_add:
                 langfuse.update_current_trace(tags=[env_name], user_id=current_app_user)
                 span.update(input={"author": new_author, "tenant": new_tenant, "sql_length": len(new_sql)})
                 
-                # Clean extraneous lines before processing
                 cleaned_sql = clean_extraneous_lines(new_sql)
-                
                 norm_sql = normalize_sql(cleaned_sql)
+                
                 if not norm_sql:
                     st.error("No valid SQL detected.")
                     st.stop()
                     
                 doc_id = generate_doc_id(new_author, new_tenant, norm_sql)
                 
-                # Check for redundancy
-                existing = collection.get(ids=[doc_id])
-                if existing and existing['ids']:
+                # Deduplication check in Pinecone namespace
+                fetch_res = index.fetch(ids=[doc_id], namespace=env_name)
+                if doc_id in fetch_res.vectors:
                     st.warning(f"This exact query is already present in the database for author '{new_author}' and tenant '{new_tenant}'.")
                     span.update(output="Redundant query rejected.")
                 else:
                     with st.spinner("Analyzing with LLM..."):
                         enrichment = generate_enrichment_data(cleaned_sql)
                         tables_list = enrichment.get("tables_involved", [])
-                        tables_str = f",{','.join(tables_list)}," if tables_list else ""
+                        summary_text = enrichment.get("summary", "")
                         
-                        collection.add(
-                            documents=[enrichment.get("summary", "")], 
-                            metadatas=[{
-                                "raw_sql": cleaned_sql.strip(), 
-                                "normalized_sql": norm_sql,
-                                "query_type": enrichment.get("query_type", "UNKNOWN"),
-                                "tables_involved": tables_str,
-                                "author": new_author,
-                                "tenant": new_tenant
-                            }],
-                            ids=[doc_id]
-                        )
+                        vector = get_embedding(summary_text)
+                        
+                        metadata = {
+                            "summary": summary_text,
+                            "raw_sql": cleaned_sql.strip(), 
+                            "normalized_sql": norm_sql,
+                            "query_type": enrichment.get("query_type", "UNKNOWN"),
+                            "tables_involved": tables_list,
+                            "author": new_author,
+                            "tenant": new_tenant
+                        }
+                        
+                        index.upsert(vectors=[{"id": doc_id, "values": vector, "metadata": metadata}], namespace=env_name)
+                        
                     exec_time = time.time() - start_time
                     st.success(f"Added successfully in {exec_time:.2f} seconds!")
                     span.update(output="Query ingested.", metadata={"execution_time_sec": exec_time})
             
             langfuse.flush()
+            time.sleep(2)
+            st.rerun()
         else:
             st.error("Please provide Author, Tenant, and SQL.")
 
 # --- TAB 4: VAULT OVERVIEW ---
 with tab_vault:
     st.subheader("Your Query Vault")
-    if st.button("Refresh Vault Data"):
-        all_data = collection.get(include=["documents", "metadatas"])
-        if all_data['ids']:
-            vault_rows = []
-            for i in range(len(all_data['ids'])):
-                vault_rows.append({
-                    "Author": all_data['metadatas'][i].get('author', ''),
-                    "Tenant": all_data['metadatas'][i].get('tenant', ''),
-                    "Summary": all_data['documents'][i],
-                    "Type": all_data['metadatas'][i].get('query_type', ''),
-                    "Tables": all_data['metadatas'][i].get('tables_involved', '').strip(',').replace(',', ', ')
-                })
-            st.dataframe(pd.DataFrame(vault_rows), width='stretch')
-        else:
-            st.info("Your vault is currently empty.")
+    st.write("Review all generated intent summaries and metadata across the entire database.")
+    
+    if all_db_records:
+        vault_rows = []
+        for record in all_db_records:
+            meta = record.metadata
+            if not meta: continue
+            vault_rows.append({
+                "Author": meta.get('author', ''),
+                "Tenant": meta.get('tenant', ''),
+                "Summary": meta.get('summary', ''),
+                "Type": meta.get('query_type', ''),
+                "Table(s)": ", ".join(meta.get('tables_involved', []))
+            })
+        st.dataframe(pd.DataFrame(vault_rows), width='stretch')
+    else:
+        st.info("Your vault is currently empty.")
