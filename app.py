@@ -288,6 +288,7 @@ with tab_search:
                 
                 exec_time = time.time() - start_time
                 st.success(f"Search completed in {exec_time:.2f} seconds.")
+                st.divider()
                 
                 logged_results = []
                 if results.matches:
